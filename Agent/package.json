@@ -1,0 +1,31 @@
+{
+  "name": "mycli",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "mycli": "./bin/mycli.js"
+  },
+  "scripts": {
+    "agent": "node --env-file=../.env --import tsx ./agent.ts",
+    "mycli": "node --env-file=../.env --import tsx ./cli.ts",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "commander": "^14.0.3",
+    "openai": "^6.7.0",
+    "tsx": "^4.20.6"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.35.0",
+    "@types/node": "^24.5.2",
+    "eslint": "^9.35.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^16.4.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.44.1"
+  }
+}
