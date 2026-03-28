@@ -1,9 +1,13 @@
 import { Command } from "commander";
 import { once } from "node:events";
-import { Agent } from "./agent.js";
+import { createInterface } from "node:readline/promises";
+import { Agent, AgentSession } from "./agent.js";
+import type { ChatCommandOptions } from "./types.js";
 
 const program = new Command();
 const defaultTypingDelay = Number(process.env.MYCLI_TYPING_DELAY_MS ?? 8);
+const interactiveIntro =
+  "Entering interactive chat. Type /exit to quit, /clear to reset the conversation.\n";
 
 function sleep(ms: number) {
   return new Promise((resolve) => {
@@ -33,29 +37,92 @@ async function renderText(text: string, typing: boolean) {
   }
 }
 
+async function runChat(session: AgentSession, message: string, typing: boolean) {
+  return session.chat(message, {
+    onText: async (text) => {
+      await renderText(text, typing);
+    },
+  });
+}
+
+function isInteractiveExit(error: unknown) {
+  return error instanceof Error && error.message === "Aborted with Ctrl+C";
+}
+
+async function runInteractiveChat(typing: boolean) {
+  const readline = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  const agent = new Agent();
+  const session = agent.createSession();
+
+  await writeStdout(interactiveIntro);
+
+  try {
+    while (true) {
+      let input: string;
+
+      try {
+        input = await readline.question("> ");
+      } catch (error) {
+        if (isInteractiveExit(error)) {
+          await writeStdout("\n");
+          return;
+        }
+
+        throw error;
+      }
+
+      const message = input.trim();
+
+      if (!message) {
+        continue;
+      }
+
+      if (message === "/exit") {
+        await writeStdout("\n");
+        return;
+      }
+
+      if (message === "/clear") {
+        session.clear();
+        await writeStdout("Conversation cleared.\n");
+        continue;
+      }
+
+      await runChat(session, message, typing);
+      await writeStdout("\n");
+    }
+  } finally {
+    readline.close();
+  }
+}
+
 program
   .name("mycli")
   .description("A minimal streaming chat CLI")
-  .version("0.1.0");
+  .version("0.1.0")
+  .action(async () => {
+    await runInteractiveChat(true);
+  });
 
 program
   .command("chat")
-  .argument("<message...>", "message to send")
+  .description("Send a message, or enter interactive mode when no message is provided")
+  .argument("[message...]", "message to send")
   .option("--no-typing", "disable the local typewriter effect")
-  .action(async (messageParts: string[], options: { typing: boolean }) => {
+  .action(async (messageParts: string[], options: ChatCommandOptions) => {
+    if (messageParts.length === 0) {
+      await runInteractiveChat(options.typing);
+      return;
+    }
+
     const agent = new Agent();
+    const session = agent.createSession();
     const message = messageParts.join(" ");
 
-    await agent.chat(
-      {
-        content: message,
-      },
-      {
-        onText: async (text) => {
-          await renderText(text, options.typing);
-        },
-      }
-    );
+    await runChat(session, message, options.typing);
 
     process.stdout.write("\n");
   });
