@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
+import ToolManager from "./tool.js";
 import type {
   AgentConfig,
   AgentMessage,
@@ -10,8 +11,22 @@ import type {
   SessionChatOptions,
   SessionOptions,
   SessionToolResultOptions,
-  StreamingChatRequest,
+  TokenUsage,
 } from "./types.js";
+
+const TOOL_SYSTEM_PROMPT =
+  "Use tools when you need private or document-backed knowledge. If the user asks about anything you do not know, are unsure about, cannot verify from the current conversation, or that may exist in the knowledge base, automatically search the knowledge base before answering. For unfamiliar names, people, products, companies, terms, policies, or internal facts, prefer searching first. Answer directly only when you are confident no knowledge-base lookup is needed. If a tool result is insufficient, say so instead of guessing.";
+const MAX_TOOL_ROUNDS = 5;
+
+type RetrievalClient = {
+  enabled: boolean;
+  search: (query: string) => Promise<unknown[]>;
+};
+
+type CompletionLoopResult = {
+  content: string;
+  usage?: TokenUsage;
+};
 
 function readRequiredEnv(name: string) {
   const value = process.env[name]?.trim();
@@ -50,18 +65,96 @@ function cloneMessages(messages: AgentMessage[]) {
   return structuredClone(messages);
 }
 
-function buildRequestMessages(state: ConversationState): AgentMessage[] {
-  if (!state.systemPrompt) {
-    return state.messages;
+function buildRequestMessages(
+  state: ConversationState,
+  includeToolGuidance: boolean
+): AgentMessage[] {
+  const messages: AgentMessage[] = [];
+
+  if (includeToolGuidance) {
+    messages.push({
+      role: "system",
+      content: TOOL_SYSTEM_PROMPT,
+    });
   }
 
-  return [
-    {
+  if (state.systemPrompt) {
+    messages.push({
       role: "system",
       content: state.systemPrompt,
-    },
-    ...state.messages,
-  ];
+    });
+  }
+
+  messages.push(...state.messages);
+  return messages;
+}
+
+function normalizeAssistantContent(content: string | null | undefined) {
+  return typeof content === "string" ? content : "";
+}
+
+function parseToolInput(toolName: string, rawArguments: string) {
+  if (!rawArguments.trim()) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(rawArguments);
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Unknown JSON parse error";
+    throw new Error(`Invalid arguments for tool "${toolName}": ${message}`);
+  }
+}
+
+function serializeToolResult(result: unknown) {
+  if (typeof result === "string") {
+    return result;
+  }
+
+  return JSON.stringify(result);
+}
+
+function normalizeUsage(
+  usage: OpenAI.CompletionUsage | undefined,
+  rounds: number
+): TokenUsage | undefined {
+  if (!usage) {
+    return undefined;
+  }
+
+  return {
+    promptTokens: usage.prompt_tokens ?? 0,
+    completionTokens: usage.completion_tokens ?? 0,
+    totalTokens: usage.total_tokens ?? 0,
+    rounds,
+  };
+}
+
+function mergeUsage(
+  current: TokenUsage | undefined,
+  next: TokenUsage | undefined
+) {
+  if (!current) {
+    return next;
+  }
+
+  if (!next) {
+    return current;
+  }
+
+  return {
+    promptTokens: current.promptTokens + next.promptTokens,
+    completionTokens: current.completionTokens + next.completionTokens,
+    totalTokens: current.totalTokens + next.totalTokens,
+    rounds: current.rounds + next.rounds,
+  };
+}
+
+function isFunctionToolCall(
+  toolCall: OpenAI.ChatCompletionMessageToolCall
+): toolCall is OpenAI.ChatCompletionMessageFunctionToolCall {
+  return toolCall.type === "function";
 }
 
 export function loadAgentConfigFromEnv(): AgentConfig {
@@ -112,7 +205,11 @@ export class AgentSession {
     );
   }
 
-  async sendToolResult(content: string, toolCallId: string, options: SessionToolResultOptions = {}) {
+  async sendToolResult(
+    content: string,
+    toolCallId: string,
+    options: SessionToolResultOptions = {}
+  ) {
     return this.#agent.chat(
       {
         content,
@@ -131,6 +228,9 @@ export class Agent {
   #client: OpenAI;
   #config: AgentConfig;
   #conversations = new Map<string, ConversationState>();
+  #tools = new ToolManager();
+  #retrievalEnabled = readBooleanEnv("PGVECTOR_ENABLED", false);
+  #retrieval?: Promise<RetrievalClient>;
 
   constructor(config: AgentConfig = loadAgentConfigFromEnv()) {
     this.#config = config;
@@ -138,6 +238,7 @@ export class Agent {
       apiKey: config.apiKey,
       baseURL: config.baseURL,
     });
+    this.#registerBuiltInTools();
   }
 
   createSession(options: SessionOptions = {}) {
@@ -153,28 +254,29 @@ export class Agent {
     return cloneMessages(state?.messages ?? []);
   }
 
-  async chat(chatRequest: ChatRequest, options: ChatOptions = {}): Promise<ChatResult> {
+  async chat(
+    chatRequest: ChatRequest,
+    options: ChatOptions = {}
+  ): Promise<ChatResult> {
     const conversationId = chatRequest.conversationId ?? randomUUID();
     const state = this.#getConversation(conversationId);
+    const initialMessageCount = state.messages.length;
     const nextMessage = toConversationMessage(chatRequest);
 
     this.#applyRequestContext(state, chatRequest);
     state.messages.push(nextMessage);
 
     let assistantContent = "";
+    let usage: TokenUsage | undefined;
 
     try {
-      const stream = await this.#createStream(state);
-      assistantContent = await this.#consumeStream(stream, options);
+      const result = await this.#runCompletionLoop(state, options);
+      assistantContent = result.content;
+      usage = result.usage;
     } catch (error) {
-      this.#rollbackPendingMessage(conversationId, state);
+      this.#rollbackConversation(conversationId, state, initialMessageCount);
       throw error;
     }
-
-    state.messages.push({
-      role: "assistant",
-      content: assistantContent,
-    });
 
     if (options.onComplete) {
       await options.onComplete(assistantContent);
@@ -184,6 +286,7 @@ export class Agent {
       conversationId,
       content: assistantContent,
       messages: cloneMessages(state.messages),
+      usage,
     };
   }
 
@@ -211,49 +314,201 @@ export class Agent {
     }
   }
 
-  async #createStream(state: ConversationState) {
-    const request: StreamingChatRequest = {
-      model: state.model ?? this.#config.model,
-      messages: buildRequestMessages(state),
-      stream: true,
-      reasoning_split: this.#config.reasoningSplit,
-    };
+  #registerBuiltInTools() {
+    if (!this.#retrievalEnabled) {
+      return;
+    }
 
-    return this.#client.chat.completions.create(request as OpenAI.ChatCompletionCreateParamsStreaming);
+    this.#tools.register({
+      name: "search_knowledge_base",
+      description:
+        "Automatically search the private knowledge base whenever the answer may depend on unknown, uncertain, domain-specific, document-backed, company-specific, person-specific, product-specific, or internal information. Use this tool before answering when you are missing facts or are not confident in the answer.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "The search query to run against the knowledge base.",
+          },
+        },
+        required: ["query"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        const query =
+          typeof input === "object" &&
+          input !== null &&
+          "query" in input &&
+          typeof input.query === "string"
+            ? input.query.trim()
+            : "";
+
+        if (!query) {
+          throw new Error(
+            'Tool "search_knowledge_base" requires a non-empty "query".'
+          );
+        }
+
+        const retrieval = await this.#getRetrieval();
+        const results = await retrieval.search(query);
+        return {
+          query,
+          count: results.length,
+          results,
+        };
+      },
+    });
   }
 
-  async #consumeStream(
-    stream: AsyncIterable<{
-      choices?: Array<{
-        delta?: {
-          content?: string | null;
-        };
-      }>;
-    }>,
-    options: ChatOptions
-  ) {
-    let assistantContent = "";
+  async #getRetrieval(): Promise<RetrievalClient> {
+    if (!this.#retrieval) {
+      this.#retrieval = import("./retrieval.js")
+        .then(({ PostgresRetrieval }) => new PostgresRetrieval())
+        .then((retrieval) => {
+          if (!retrieval.enabled) {
+            throw new Error("Knowledge base retrieval is disabled.");
+          }
 
-    for await (const chunk of stream) {
-      const text = chunk.choices?.[0]?.delta?.content;
-      if (!text) {
+          return retrieval;
+        })
+        .catch((error) => {
+          this.#retrieval = undefined;
+          const message =
+            error instanceof Error
+              ? error.message
+              : "Unknown retrieval initialization error";
+          throw new Error(
+            `Failed to initialize knowledge base retrieval: ${message}`
+          );
+        });
+    }
+
+    return this.#retrieval;
+  }
+
+  async #runCompletionLoop(
+    state: ConversationState,
+    options: ChatOptions
+  ): Promise<CompletionLoopResult> {
+    let totalUsage: TokenUsage | undefined;
+
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+      const completion = await this.#createCompletion(state);
+      const message = completion.choices[0]?.message;
+      totalUsage = mergeUsage(totalUsage, normalizeUsage(completion.usage, 1));
+
+      if (!message) {
+        break;
+      }
+
+      const functionToolCalls =
+        message.tool_calls?.filter(isFunctionToolCall) ?? [];
+
+      if (functionToolCalls.length) {
+        state.messages.push({
+          role: "assistant",
+          content: normalizeAssistantContent(message.content) || null,
+          tool_calls: functionToolCalls.map((toolCall) => ({
+            id: toolCall.id,
+            type: "function",
+            function: {
+              name: toolCall.function.name,
+              arguments: toolCall.function.arguments,
+            },
+          })),
+        });
+
+        const toolMessages = await this.#executeToolCalls(functionToolCalls);
+        state.messages.push(...toolMessages);
         continue;
       }
 
-      assistantContent += text;
+      const assistantContent = normalizeAssistantContent(message.content);
 
-      if (options.onText) {
-        await options.onText(text);
-      } else {
-        process.stdout.write(text);
+      state.messages.push({
+        role: "assistant",
+        content: assistantContent,
+      });
+
+      if (assistantContent) {
+        if (options.onText) {
+          await options.onText(assistantContent);
+        } else {
+          process.stdout.write(assistantContent);
+        }
       }
+
+      return {
+        content: assistantContent,
+        usage: totalUsage,
+      };
     }
 
-    return assistantContent;
+    throw new Error(`Tool loop exceeded ${MAX_TOOL_ROUNDS} rounds.`);
   }
 
-  #rollbackPendingMessage(conversationId: string, state: ConversationState) {
-    state.messages.pop();
+  async #createCompletion(state: ConversationState) {
+    const tools = this.#tools.toOpenAITools();
+    const request = {
+      model: state.model ?? this.#config.model,
+      messages: buildRequestMessages(state, this.#tools.hasTools()),
+      reasoning_split: this.#config.reasoningSplit,
+      ...(tools.length > 0
+        ? {
+            tools,
+            tool_choice: "auto" as const,
+          }
+        : {}),
+    };
+
+    return this.#client.chat.completions.create(
+      request as OpenAI.ChatCompletionCreateParamsNonStreaming
+    );
+  }
+
+  async #executeToolCalls(
+    toolCalls: OpenAI.ChatCompletionMessageFunctionToolCall[]
+  ) {
+    return Promise.all(
+      toolCalls.map(async (toolCall) => {
+        try {
+          const input = parseToolInput(
+            toolCall.function.name,
+            toolCall.function.arguments
+          );
+          const result = await this.#tools.execute(
+            toolCall.function.name,
+            input
+          );
+
+          return {
+            role: "tool" as const,
+            tool_call_id: toolCall.id,
+            content: serializeToolResult(result),
+          };
+        } catch (error) {
+          const message =
+            error instanceof Error
+              ? error.message
+              : "Unknown tool execution error";
+          return {
+            role: "tool" as const,
+            tool_call_id: toolCall.id,
+            content: JSON.stringify({
+              error: message,
+            }),
+          };
+        }
+      })
+    );
+  }
+
+  #rollbackConversation(
+    conversationId: string,
+    state: ConversationState,
+    initialMessageCount: number
+  ) {
+    state.messages.splice(initialMessageCount);
 
     if (state.messages.length === 0 && !state.model && !state.systemPrompt) {
       this.#conversations.delete(conversationId);

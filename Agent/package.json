@@ -16,11 +16,13 @@
   "dependencies": {
     "commander": "^14.0.3",
     "openai": "^6.7.0",
+    "pg": "^8.16.3",
     "tsx": "^4.20.6"
   },
   "devDependencies": {
     "@eslint/js": "^9.35.0",
     "@types/node": "^24.5.2",
+    "@types/pg": "^8.15.5",
     "eslint": "^9.35.0",
     "eslint-config-prettier": "^10.1.8",
     "globals": "^16.4.0",

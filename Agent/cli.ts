@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { once } from "node:events";
 import { createInterface } from "node:readline/promises";
 import { Agent, AgentSession } from "./agent.js";
-import type { ChatCommandOptions } from "./types.js";
+import type { ChatCommandOptions, TokenUsage } from "./types.js";
 
 const program = new Command();
 const defaultTypingDelay = Number(process.env.MYCLI_TYPING_DELAY_MS ?? 8);
@@ -37,12 +37,24 @@ async function renderText(text: string, typing: boolean) {
   }
 }
 
-async function runChat(session: AgentSession, message: string, typing: boolean) {
+async function runChat(
+  session: AgentSession,
+  message: string,
+  typing: boolean
+) {
   return session.chat(message, {
     onText: async (text) => {
       await renderText(text, typing);
     },
   });
+}
+
+function formatUsage(usage: TokenUsage | undefined) {
+  if (!usage) {
+    return null;
+  }
+
+  return `\n[token usage] prompt=${usage.promptTokens} completion=${usage.completionTokens} total=${usage.totalTokens} rounds=${usage.rounds}\n`;
 }
 
 function isInteractiveExit(error: unknown) {
@@ -91,8 +103,13 @@ async function runInteractiveChat(typing: boolean) {
         continue;
       }
 
-      await runChat(session, message, typing);
+      const result = await runChat(session, message, typing);
       await writeStdout("\n");
+
+      const usageText = formatUsage(result.usage);
+      if (usageText) {
+        await writeStdout(usageText);
+      }
     }
   } finally {
     readline.close();
@@ -109,7 +126,9 @@ program
 
 program
   .command("chat")
-  .description("Send a message, or enter interactive mode when no message is provided")
+  .description(
+    "Send a message, or enter interactive mode when no message is provided"
+  )
   .argument("[message...]", "message to send")
   .option("--no-typing", "disable the local typewriter effect")
   .action(async (messageParts: string[], options: ChatCommandOptions) => {
@@ -122,9 +141,14 @@ program
     const session = agent.createSession();
     const message = messageParts.join(" ");
 
-    await runChat(session, message, options.typing);
+    const result = await runChat(session, message, options.typing);
 
     process.stdout.write("\n");
+
+    const usageText = formatUsage(result.usage);
+    if (usageText) {
+      process.stdout.write(usageText);
+    }
   });
 
 program.parseAsync().catch((error: unknown) => {

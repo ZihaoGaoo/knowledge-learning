@@ -37,10 +37,18 @@ export type ChatOptions = {
   onComplete?: (message: string) => void | Promise<void>;
 };
 
+export type TokenUsage = {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  rounds: number;
+};
+
 export type ChatResult = {
   conversationId: string;
   content: string;
   messages: AgentMessage[];
+  usage?: TokenUsage;
 };
 
 export type ConversationState = {
