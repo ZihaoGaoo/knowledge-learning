@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
+import McpClientManager from "./mcp.js";
 import ToolManager from "./tool.js";
 import type {
   AgentConfig,
@@ -15,7 +16,7 @@ import type {
 } from "./types.js";
 
 const TOOL_SYSTEM_PROMPT =
-  "Use tools when you need private or document-backed knowledge. If the user asks about anything you do not know, are unsure about, cannot verify from the current conversation, or that may exist in the knowledge base, automatically search the knowledge base before answering. For unfamiliar names, people, products, companies, terms, policies, or internal facts, prefer searching first. Answer directly only when you are confident no knowledge-base lookup is needed. If a tool result is insufficient, say so instead of guessing.";
+  "Use tools when you need private or document-backed knowledge. If the user asks about anything you do not know, are unsure about, cannot verify from the current conversation, or that may exist in the knowledge base, automatically search before answering. For unfamiliar names, people, products, companies, terms, policies, internal facts, or current web information, prefer using the available search or external tools first. Answer directly only when you are confident no tool lookup is needed. If a tool result is insufficient, say so instead of guessing.";
 const MAX_TOOL_ROUNDS = 5;
 
 type RetrievalClient = {
@@ -91,6 +92,20 @@ function buildRequestMessages(
 
 function normalizeAssistantContent(content: string | null | undefined) {
   return typeof content === "string" ? content : "";
+}
+
+function normalizeToolName(value: string) {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  if (!normalized) {
+    return "tool";
+  }
+
+  return /^[a-z_]/.test(normalized) ? normalized : `tool_${normalized}`;
 }
 
 function parseToolInput(toolName: string, rawArguments: string) {
@@ -229,6 +244,8 @@ export class Agent {
   #config: AgentConfig;
   #conversations = new Map<string, ConversationState>();
   #tools = new ToolManager();
+  #mcp = new McpClientManager();
+  #mcpToolsLoaded?: Promise<void>;
   #retrievalEnabled = readBooleanEnv("PGVECTOR_ENABLED", false);
   #retrieval?: Promise<RetrievalClient>;
 
@@ -360,6 +377,61 @@ export class Agent {
     });
   }
 
+  async #ensureMcpToolsRegistered() {
+    if (!this.#mcp.enabled) {
+      return;
+    }
+
+    if (!this.#mcpToolsLoaded) {
+      this.#mcpToolsLoaded = this.#loadMcpTools().catch((error) => {
+        this.#mcpToolsLoaded = undefined;
+        throw error;
+      });
+    }
+
+    await this.#mcpToolsLoaded;
+  }
+
+  async #loadMcpTools() {
+    const tools = await this.#mcp.listTools();
+    const nameCounts = new Map<string, number>();
+
+    for (const tool of tools) {
+      const normalizedName = normalizeToolName(tool.name);
+      nameCounts.set(normalizedName, (nameCounts.get(normalizedName) ?? 0) + 1);
+    }
+
+    for (const tool of tools) {
+      const normalizedName = normalizeToolName(tool.name);
+      const serverPrefix = normalizeToolName(tool.server);
+      const baseName =
+        (nameCounts.get(normalizedName) ?? 0) > 1
+          ? `${serverPrefix}__${normalizedName}`
+          : normalizedName;
+
+      let exposedName = baseName;
+      let suffix = 2;
+      while (this.#tools.has(exposedName)) {
+        exposedName = `${baseName}_${suffix}`;
+        suffix += 1;
+      }
+
+      this.#tools.register({
+        name: exposedName,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+        execute: async (input) => {
+          const args =
+            typeof input === "object" && input !== null && !Array.isArray(input)
+              ? (input as Record<string, unknown>)
+              : undefined;
+
+          return this.#mcp.callTool(tool.server, tool.name, args);
+        },
+      });
+    }
+  }
+
   async #getRetrieval(): Promise<RetrievalClient> {
     if (!this.#retrieval) {
       this.#retrieval = import("./retrieval.js")
@@ -418,6 +490,10 @@ export class Agent {
           })),
         });
 
+        process.stdout.write(
+          `> 当前调用tool: ${functionToolCalls.map((tool) => tool.function.name)}\n`
+        );
+
         const toolMessages = await this.#executeToolCalls(functionToolCalls);
         state.messages.push(...toolMessages);
         continue;
@@ -448,6 +524,8 @@ export class Agent {
   }
 
   async #createCompletion(state: ConversationState) {
+    await this.#ensureMcpToolsRegistered();
+
     const tools = this.#tools.toOpenAITools();
     const request = {
       model: state.model ?? this.#config.model,

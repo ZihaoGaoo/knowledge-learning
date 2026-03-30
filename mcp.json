@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "MiniMax": {
+      "command": "/Users/gaozihao/.local/bin/uvx",
+      "args": ["--isolated", "minimax-coding-plan-mcp"],
+      "env": {
+        "MINIMAX_API_KEY": "${OPENAI_API_KEY}",
+        "MINIMAX_MCP_BASE_PATH": "/Users/gaozihao/Project/knowledge-learning/.mcp-output",
+        "MINIMAX_API_HOST": "https://api.minimaxi.com",
+        "MINIMAX_API_RESOURCE_MODE": "url",
+        "UV_CACHE_DIR": "/Users/gaozihao/Project/knowledge-learning/.uv-cache"
+      }
+    }
+  }
+}

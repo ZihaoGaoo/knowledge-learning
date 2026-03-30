@@ -43,6 +43,10 @@ export default class ToolManager {
     }));
   }
 
+  has(name: string) {
+    return this.#tools.has(name.trim());
+  }
+
   hasTools() {
     return this.#tools.size > 0;
   }
