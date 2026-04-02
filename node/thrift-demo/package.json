@@ -1,0 +1,13 @@
+{
+  "name": "thrift-demo",
+  "private": true,
+  "scripts": {
+    "generate": "thrift -r --gen js:node inventory.thrift",
+    "server": "node server.js",
+    "client": "node client.js"
+  },
+  "dependencies": {
+    "node-int64": "^0.4.0",
+    "thrift": "^0.22.0"
+  }
+}

@@ -28,6 +28,10 @@
 - Node 如何创建一个 HTTP 服务？
 - HTTP 和 HTTPS 的区别？
 - TCP、UDP、HTTP、WebSocket 的区别？
+- 什么是 RPC？RPC 和 HTTP API 的区别是什么？
+- 如果让你用 Node 写一个 RPC 小场景，你会怎么设计“订单服务调用库存服务”？
+- Thrift 是什么？为什么它也属于 RPC 体系？
+- 如果让你用 `.thrift` 文件定义一个库存服务，你会怎么设计 `struct`、`exception` 和 `service`？
 - 长连接和短连接是什么？
 - 如何实现文件上传、下载、断点续传？
 
